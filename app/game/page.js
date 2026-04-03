@@ -222,7 +222,7 @@ function GameBoard(){
     if(pos===299)return false;
     if(pos===-1)return val===6&&!isCombined&&diceLeftRef.current.includes(6);
     // In home lane — must not overshoot
-    if(pos>=200)return val===(204-pos)+1;
+    if(pos>=200)return val<=(204-pos)+1;
     // On main track — check if val would overshoot home
     const steps=stepsToHome(p,pos);
     if(val>steps)return false; // would overshoot — not allowed
