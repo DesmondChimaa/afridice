@@ -169,18 +169,17 @@ function GameBoard(){
         if(gs.diceLeft!==undefined){
           diceLeftRef.current=gs.diceLeft;
           setDiceLeft(gs.diceLeft);
-          // Show pills if it's my turn and there are dice left
-          if(gs.diceLeft.length>0&&isMyTurn(gs.currentTurnIdx||0)){
-            setGamePhase('SELECT_DIE');
-            phaseRef.current='SELECT_DIE';
-            const d=gs.diceLeft;
-            setPillVal1(d[0]);
-            if(d.length>1){setPillVal2(d[1]);setPillValC(d[0]+d[1]);}
+          // NEVER force pills from Firebase listener
+          // Pills are only set when THIS player rolls on their own device
+          // If diceLeft is empty, reset phase to IDLE for this player
+          if(gs.diceLeft.length===0&&phaseRef.current==='SELECT_DIE'){
+            setGamePhase('IDLE');phaseRef.current='IDLE';
           }
         }
         if(gs.phase){
-          // Only update phase if it's opponent's action
-          if(!isMyTurn(gs.currentTurnIdx||0)){
+          // Only update phase for opponent actions, never override our own SELECT_DIE
+          const isMine=isMyTurn(gs.currentTurnIdx||0);
+          if(!isMine){
             setGamePhase(gs.phase);
             phaseRef.current=gs.phase;
           }
@@ -267,7 +266,7 @@ function GameBoard(){
   },[currentTurnIdx,winner]);
 
   // ── DRAW BOARD ────────────────────────────────────────────
-  useEffect(()=>{
+  function drawBoard(){
     const canvas=canvasRef.current;
     const board=boardRef.current;
     if(!canvas||!board)return;
@@ -303,7 +302,20 @@ function GameBoard(){
     for(let r=0;r<15;r++)for(let c=6;c<9;c++)ctx.strokeRect(c*C,r*C,C,C);
     for(let r=6;r<9;r++)for(let c=0;c<15;c++)ctx.strokeRect(c*C,r*C,C,C);
     ctx.strokeStyle='#888';ctx.lineWidth=2;ctx.strokeRect(1,1,S-2,S-2);
-  },[]);
+  }
+
+  useEffect(()=>{
+    // Draw immediately and also after delays to catch late renders
+    drawBoard();
+    const t1=setTimeout(drawBoard,100);
+    const t2=setTimeout(drawBoard,500);
+    const t3=setTimeout(drawBoard,1000);
+    // Also use ResizeObserver
+    const ro=new ResizeObserver(drawBoard);
+    if(boardRef.current)ro.observe(boardRef.current);
+    return()=>{clearTimeout(t1);clearTimeout(t2);clearTimeout(t3);ro.disconnect();};
+  // eslint-disable-next-line
+  },[opponentJoined]);
 
   // ── SYNC TO FIREBASE ──────────────────────────────────────
   async function syncState(updates){
@@ -391,10 +403,11 @@ function GameBoard(){
     setPillVal1(d1);setPillVal2(d2);setPillValC(d1+d2);
     updateLabel(turnIdxRef.current,null,true);
 
-    // Sync roll to Firebase
+    // Sync roll to Firebase — sync dice display only, NOT diceLeft
+    // diceLeft is local state only, never shared to avoid spill-over bug
     await syncState({
       diceValues:[d1,d2],
-      diceLeft:[d1,d2],
+      diceLeft:[],
       currentTurnIdx:turnIdxRef.current,
       phase:'SELECT_DIE',
       originalDice:[d1,d2],
@@ -552,7 +565,7 @@ function GameBoard(){
         // Sync current state
         await syncState({
           positions:posRef.current,
-          diceLeft:newDiceLeft,
+          diceLeft:[],
           currentTurnIdx:nextIdx,
           phase:newPhase,
         });
@@ -651,29 +664,29 @@ function GameBoard(){
   }
 
   return(
-    <div className="min-h-screen bg-[#1a1a2e] flex flex-col items-center py-3 px-2">
+    <div className="h-screen bg-[#1a1a2e] flex flex-col items-center overflow-hidden px-2 pt-2 pb-1">
 
       {/* My turn indicator */}
       {myTurn&&!winner&&(
-        <div className="w-full max-w-sm mb-1 py-1 px-3 rounded-lg bg-yellow-400/20 border border-yellow-400/50 text-center">
+        <div className="w-full max-w-sm mb-1 py-0.5 px-3 rounded-lg bg-yellow-400/20 border border-yellow-400/50 text-center">
           <p className="text-yellow-400 text-xs font-bold">⚡ YOUR TURN</p>
         </div>
       )}
 
       {/* Scores */}
-      <div className="flex gap-2 w-full max-w-sm mb-2">
-        <div className={`flex-1 py-2 px-3 rounded-xl text-center transition-all ${isP1Turn?'bg-gradient-to-r from-red-600 to-red-700 ring-2 ring-yellow-400':'bg-[#ffffff10]'}`}>
-          <p className="text-white text-xs font-bold">Player 1 {playerNum===1?'(You)':''}</p>
-          <p className="text-white text-xl font-black">{score1}</p>
+      <div className="flex gap-2 w-full max-w-sm mb-1">
+        <div className={`flex-1 py-1.5 px-3 rounded-xl text-center transition-all ${isP1Turn?'bg-gradient-to-r from-red-600 to-red-700 ring-2 ring-yellow-400':'bg-[#ffffff10]'}`}>
+          <p className="text-white text-xs font-bold">P1 {playerNum===1?'(You)':''}</p>
+          <p className="text-white text-lg font-black">{score1}</p>
         </div>
-        <div className={`flex-1 py-2 px-3 rounded-xl text-center transition-all ${!isP1Turn?'bg-gradient-to-r from-green-700 to-green-800 ring-2 ring-yellow-400':'bg-[#ffffff10]'}`}>
-          <p className="text-white text-xs font-bold">Player 2 {playerNum===2?'(You)':''}</p>
-          <p className="text-white text-xl font-black">{score2}</p>
+        <div className={`flex-1 py-1.5 px-3 rounded-xl text-center transition-all ${!isP1Turn?'bg-gradient-to-r from-green-700 to-green-800 ring-2 ring-yellow-400':'bg-[#ffffff10]'}`}>
+          <p className="text-white text-xs font-bold">P2 {playerNum===2?'(You)':''}</p>
+          <p className="text-white text-lg font-black">{score2}</p>
         </div>
       </div>
 
       {/* Board */}
-      <div ref={boardRef} className="relative w-full max-w-sm aspect-square rounded-xl overflow-hidden shadow-2xl mb-2">
+      <div ref={boardRef} className="relative w-full max-w-sm aspect-square rounded-xl overflow-hidden shadow-2xl mb-1" style={{maxHeight:'45vh'}}>
         <canvas ref={canvasRef} className="absolute inset-0 w-full h-full"/>
         {['P1','P2','P3','P4'].map(p=>
           positions[p].map((pos,i)=>{
@@ -711,40 +724,40 @@ function GameBoard(){
         )}
       </div>
 
-      {/* Dice */}
-      <div className="flex gap-3 items-center bg-[#0d4a5a] px-4 py-2 rounded-2xl mb-1">
-        <DieFace value={diceValues[0]} rolling={rolling}/>
-        <DieFace value={diceValues[1]} rolling={rolling}/>
-      </div>
-      <p className="text-gray-400 text-xs mb-1">{resultText}</p>
-
-      {/* Timer */}
-      <div className="w-full max-w-sm mb-2">
-        <div className="bg-[#ffffff10] rounded-full h-2">
-          <div className="h-2 rounded-full transition-all duration-1000"
-            style={{width:`${(timerSeconds/TIMER_TOTAL)*100}%`,background:timerSeconds>30?'#27ae60':timerSeconds>10?'#f39c12':'#e74c3c'}}/>
+      {/* Dice + Timer row */}
+      <div className="flex items-center gap-3 w-full max-w-sm mb-1">
+        <div className="flex gap-2 items-center bg-[#0d4a5a] px-3 py-1.5 rounded-xl">
+          <DieFace value={diceValues[0]} rolling={rolling}/>
+          <DieFace value={diceValues[1]} rolling={rolling}/>
         </div>
-        <p className={`text-center text-xs mt-0.5 font-bold ${timerSeconds<=10?'text-red-400':timerSeconds<=30?'text-yellow-400':'text-gray-400'}`}>
-          {timerSeconds}s remaining
-        </p>
+        <div className="flex-1">
+          <p className="text-gray-400 text-xs mb-0.5">{resultText}</p>
+          <div className="bg-[#ffffff10] rounded-full h-1.5">
+            <div className="h-1.5 rounded-full transition-all duration-1000"
+              style={{width:`${(timerSeconds/TIMER_TOTAL)*100}%`,background:timerSeconds>30?'#27ae60':timerSeconds>10?'#f39c12':'#e74c3c'}}/>
+          </div>
+          <p className={`text-xs font-bold mt-0.5 ${timerSeconds<=10?'text-red-400':timerSeconds<=30?'text-yellow-400':'text-gray-400'}`}>
+            {timerSeconds}s
+          </p>
+        </div>
       </div>
 
       {/* Pills — only show on my turn */}
       {(gamePhase==='SELECT_DIE')&&myTurn&&(
-        <div className="flex gap-2 mb-2 flex-wrap justify-center">
+        <div className="flex gap-2 mb-1 flex-wrap justify-center">
           <button onClick={()=>selectDie(pillVal1,false)}
-            className={`px-4 py-2 rounded-xl font-bold text-sm text-white transition-all ${activeDie===pillVal1?'ring-2 ring-yellow-400 bg-blue-600':'bg-blue-900'}`}>
+            className={`px-3 py-1.5 rounded-xl font-bold text-xs text-white transition-all ${activeDie===pillVal1?'ring-2 ring-yellow-400 bg-blue-600':'bg-blue-900'}`}>
             Use {pillVal1}
           </button>
           {diceLeft.length===2&&(
             <button onClick={()=>selectDie(pillVal2,false)}
-              className={`px-4 py-2 rounded-xl font-bold text-sm text-white transition-all ${activeDie===pillVal2?'ring-2 ring-yellow-400 bg-red-600':'bg-red-900'}`}>
+              className={`px-3 py-1.5 rounded-xl font-bold text-xs text-white transition-all ${activeDie===pillVal2?'ring-2 ring-yellow-400 bg-red-600':'bg-red-900'}`}>
               Use {pillVal2}
             </button>
           )}
           {diceLeft.length===2&&(
             <button onClick={()=>selectDie(pillValC,true)}
-              className={`px-4 py-2 rounded-xl font-bold text-sm text-white transition-all ${activeDie===pillValC?'ring-2 ring-yellow-400 bg-green-600':'bg-green-900'}`}>
+              className={`px-3 py-1.5 rounded-xl font-bold text-xs text-white transition-all ${activeDie===pillValC?'ring-2 ring-yellow-400 bg-green-600':'bg-green-900'}`}>
               Combine {pillValC}
             </button>
           )}
@@ -765,14 +778,22 @@ function GameBoard(){
         {turnText}
       </div>
 
-      {/* Timer warning */}
-      {showWarning&&(
+      {/* Timer warning — full popup only for active player */}
+      {showWarning&&myTurn&&(
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 px-4">
           <div className="bg-[#1a2a3a] border-2 border-red-500 rounded-2xl p-6 text-center max-w-xs w-full">
             <p className="text-4xl mb-2">⏰</p>
             <p className="text-red-400 font-black text-lg mb-2">Time is running out!</p>
             <p className="text-gray-300 text-sm mb-4">10 seconds left — roll and move now!</p>
             <button onClick={()=>setShowWarning(false)} className="px-6 py-2 bg-green-500 rounded-xl text-white font-bold">I'm here! ✓</button>
+          </div>
+        </div>
+      )}
+      {/* Quiet notification for waiting player */}
+      {showWarning&&!myTurn&&(
+        <div className="fixed top-4 left-0 right-0 flex justify-center z-50 px-4">
+          <div className="bg-orange-500/90 rounded-xl px-4 py-2 text-center">
+            <p className="text-white text-xs font-bold">⏰ Opponent is running out of time...</p>
           </div>
         </div>
       )}
