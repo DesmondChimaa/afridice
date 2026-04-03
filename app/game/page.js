@@ -1,7 +1,9 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense } from 'react';
+import { db } from '../firebase';
+import { ref, onValue, update, get } from 'firebase/database';
 
 // ── CONSTANTS ──────────────────────────────────────────────
 const TRACK=[[6,13],[6,12],[6,11],[6,10],[6,9],[5,8],[4,8],[3,8],[2,8],[1,8],[0,8],[0,7],[0,6],[1,6],[2,6],[3,6],[4,6],[5,6],[6,5],[6,4],[6,3],[6,2],[6,1],[6,0],[7,0],[8,0],[8,1],[8,2],[8,3],[8,4],[8,5],[9,6],[10,6],[11,6],[12,6],[13,6],[14,6],[14,7],[14,8],[13,8],[12,8],[11,8],[10,8],[9,8],[8,9],[8,10],[8,11],[8,12],[8,13],[8,14],[7,14],[6,14]];
@@ -21,6 +23,8 @@ const COLORS={P1:'#3498db',P2:'#2ecc71',P3:'#e74c3c',P4:'#f1c40f'};
 const TOKEN_NAMES={P1:'Blue',P2:'Green',P3:'Red',P4:'Yellow'};
 const TURN_ORDER=['P4','P2','P3','P1'];
 const TIMER_TOTAL=70;
+
+const INIT_POSITIONS={P1:[-1,-1,-1,-1],P2:[-1,-1,-1,-1],P3:[-1,-1,-1,-1],P4:[-1,-1,-1,-1]};
 
 function getNextPos(p,pos){
   if(pos===-1)return START_IDX[p];
@@ -54,11 +58,17 @@ function DieFace({value,rolling}){
 
 function GameBoard(){
   const router=useRouter();
+  const params=useSearchParams();
+  const roomCode=params.get('code');
+  const playerNum=parseInt(params.get('player')||'1');
+  // playerNum=1 means this user is Player1 (controls P3,P4)
+  // playerNum=2 means this user is Player2 (controls P1,P2)
+  const myTeam=playerNum===1?PLAYER1:PLAYER2;
+
   const boardRef=useRef(null);
   const canvasRef=useRef(null);
 
-  // Game state
-  const [positions,setPositions]=useState({P1:[-1,-1,-1,-1],P2:[-1,-1,-1,-1],P3:[-1,-1,-1,-1],P4:[-1,-1,-1,-1]});
+  const [positions,setPositions]=useState(INIT_POSITIONS);
   const [diceLeft,setDiceLeft]=useState([]);
   const [activeDie,setActiveDie]=useState(null);
   const [activeIsCombined,setActiveIsCombined]=useState(false);
@@ -73,7 +83,7 @@ function GameBoard(){
   const [score2,setScore2]=useState(0);
   const [diceValues,setDiceValues]=useState([1,1]);
   const [resultText,setResultText]=useState('–, –');
-  const [turnText,setTurnText]=useState("Player 1's Turn — Yellow token");
+  const [turnText,setTurnText]=useState('');
   const [isP1Turn,setIsP1Turn]=useState(true);
   const [highlighted,setHighlighted]=useState([]);
   const [timerSeconds,setTimerSeconds]=useState(TIMER_TOTAL);
@@ -82,8 +92,9 @@ function GameBoard(){
   const [originalDice,setOriginalDice]=useState([1,1]);
   const [rolling,setRolling]=useState(false);
   const [stackPicker,setStackPicker]=useState(null);
+  const [opponentJoined,setOpponentJoined]=useState(false);
+  const [myTurn,setMyTurn]=useState(false);
 
-  // Refs for use inside async/interval
   const posRef=useRef(positions);
   const diceLeftRef=useRef([]);
   const phaseRef=useRef('IDLE');
@@ -94,6 +105,8 @@ function GameBoard(){
   const timerRef=useRef(null);
   const warningShownRef=useRef(false);
   const gameOverRef=useRef(false);
+  const timerOwnerRef=useRef(null);
+  const isListeningRef=useRef(false);
 
   useEffect(()=>{posRef.current=positions;},[positions]);
   useEffect(()=>{diceLeftRef.current=diceLeft;},[diceLeft]);
@@ -105,10 +118,103 @@ function GameBoard(){
 
   function curTeam(idx){return PLAYER1.includes(TURN_ORDER[idx])?PLAYER1:PLAYER2;}
   function isP1Turn_(idx){return PLAYER1.includes(TURN_ORDER[idx]);}
+  function isMyTurn(idx){
+    const team=curTeam(idx);
+    return playerNum===1?team===PLAYER1:team===PLAYER2;
+  }
 
-  // ── TIMER: starts fresh on each turn, runs the WHOLE turn ──
-  // Timer only resets when nextTurn() is called
-  // It does NOT stop when rolling or selecting
+  // ── FIREBASE LISTENER ─────────────────────────────────────
+  useEffect(()=>{
+    if(!roomCode||isListeningRef.current)return;
+    isListeningRef.current=true;
+
+    const roomRef=ref(db,`rooms/${roomCode}`);
+    const unsubscribe=onValue(roomRef,(snapshot)=>{
+      if(!snapshot.exists())return;
+      const data=snapshot.val();
+
+      // Check opponent joined
+      if(data.player2)setOpponentJoined(true);
+
+      // Sync game state from Firebase
+      if(data.gameState){
+        const gs=data.gameState;
+
+        // Update positions
+        if(gs.positions){
+          const pos={
+            P1:gs.positions.P1||[-1,-1,-1,-1],
+            P2:gs.positions.P2||[-1,-1,-1,-1],
+            P3:gs.positions.P3||[-1,-1,-1,-1],
+            P4:gs.positions.P4||[-1,-1,-1,-1],
+          };
+          setPositions(pos);
+          posRef.current=pos;
+        }
+
+        // Update turn
+        if(gs.currentTurnIdx!==undefined){
+          setCurrentTurnIdx(gs.currentTurnIdx);
+          turnIdxRef.current=gs.currentTurnIdx;
+          const myT=isMyTurn(gs.currentTurnIdx);
+          setMyTurn(myT);
+          updateLabel(gs.currentTurnIdx,null,myT);
+        }
+
+        // Update dice
+        if(gs.diceValues){
+          setDiceValues(gs.diceValues);
+          setResultText(`${gs.diceValues[0]}, ${gs.diceValues[1]}  (${gs.diceValues[0]+gs.diceValues[1]})`);
+        }
+        if(gs.diceLeft!==undefined){
+          diceLeftRef.current=gs.diceLeft;
+          setDiceLeft(gs.diceLeft);
+          // Show pills if it's my turn and there are dice left
+          if(gs.diceLeft.length>0&&isMyTurn(gs.currentTurnIdx||0)){
+            setGamePhase('SELECT_DIE');
+            phaseRef.current='SELECT_DIE';
+            const d=gs.diceLeft;
+            setPillVal1(d[0]);
+            if(d.length>1){setPillVal2(d[1]);setPillValC(d[0]+d[1]);}
+          }
+        }
+        if(gs.phase){
+          // Only update phase if it's opponent's action
+          if(!isMyTurn(gs.currentTurnIdx||0)){
+            setGamePhase(gs.phase);
+            phaseRef.current=gs.phase;
+          }
+        }
+        if(gs.originalDice){
+          setOriginalDice(gs.originalDice);
+          origDiceRef.current=gs.originalDice;
+        }
+        if(gs.pendingRollAgain!==undefined){
+          setPendingRollAgain(gs.pendingRollAgain);
+          pendingRef.current=gs.pendingRollAgain;
+        }
+        if(gs.winner){
+          setWinner(gs.winner);
+          gameOverRef.current=true;
+          stopTimer();
+        }
+        if(gs.score1!==undefined)setScore1(gs.score1);
+        if(gs.score2!==undefined)setScore2(gs.score2);
+      }
+    });
+
+    return()=>unsubscribe();
+  // eslint-disable-next-line
+  },[roomCode]);
+
+  // Check if it's my turn on mount and turn change
+  useEffect(()=>{
+    const myT=isMyTurn(currentTurnIdx);
+    setMyTurn(myT);
+  // eslint-disable-next-line
+  },[currentTurnIdx]);
+
+  // ── TIMER ─────────────────────────────────────────────────
   function startTimer(){
     if(timerRef.current)clearInterval(timerRef.current);
     setTimerSeconds(TIMER_TOTAL);
@@ -123,15 +229,21 @@ function GameBoard(){
         }
         if(next<=0){
           clearInterval(timerRef.current);
-          // Guard: only fire once
           if(gameOverRef.current)return 0;
           gameOverRef.current=true;
-          // Current player timed out — opponent wins
           const losing=isP1Turn_(turnIdxRef.current);
           const w=losing?'Player 2':'Player 1';
-          if(losing)setScore2(s=>s+1);else setScore1(s=>s+1);
-          setWinner({name:w,reason:'timeout'});
+          const newS1=losing?score1:score1+1;
+          const newS2=losing?score2+1:score2;
+          setScore1(newS1);setScore2(newS2);
+          const win={name:w,reason:'timeout'};
+          setWinner(win);
           setGamePhase('GAMEOVER');
+          if(roomCode){
+            update(ref(db,`rooms/${roomCode}/gameState`),{
+              winner:win,score1:newS1,score2:newS2
+            });
+          }
           return 0;
         }
         return next;
@@ -143,15 +255,8 @@ function GameBoard(){
     if(timerRef.current){clearInterval(timerRef.current);timerRef.current=null;}
   }
 
-  // Track which human player owns the current timer
-  const timerOwnerRef=useRef(null); // 'P1' or 'P2'
-
-  // Start timer when turn changes
   useEffect(()=>{
     if(winner||gameOverRef.current)return;
-    // Only start a fresh timer when human player CHANGES
-    // P1 owns turns for P3(idx2) and P4(idx0)
-    // P2 owns turns for P1(idx3) and P2(idx1)
     const humanOwner=isP1Turn_(currentTurnIdx)?'P1':'P2';
     if(timerOwnerRef.current!==humanOwner){
       timerOwnerRef.current=humanOwner;
@@ -161,7 +266,7 @@ function GameBoard(){
   // eslint-disable-next-line
   },[currentTurnIdx,winner]);
 
-  // Draw board on canvas
+  // ── DRAW BOARD ────────────────────────────────────────────
   useEffect(()=>{
     const canvas=canvasRef.current;
     const board=boardRef.current;
@@ -172,11 +277,9 @@ function GameBoard(){
     const C=S/15;
     const ctx=canvas.getContext('2d');
     ctx.fillStyle='#f5f0e8';ctx.fillRect(0,0,S,S);
-    // Corner bases
     [{c:0,r:0,fill:'#2ecc71'},{c:9,r:0,fill:'#f1c40f'},{c:0,r:9,fill:'#e74c3c'},{c:9,r:9,fill:'#3498db'}].forEach(({c,r,fill})=>{
       ctx.fillStyle=fill;ctx.fillRect(c*C,r*C,6*C,6*C);
     });
-    // Base circles
     const bc={P2:[[1.5,1.5],[4,1.5],[1.5,4],[4,4]],P4:[[10.5,1.5],[13,1.5],[10.5,4],[13,4]],P3:[[1.5,10.5],[4,10.5],[1.5,13],[4,13]],P1:[[10.5,10.5],[13,10.5],[10.5,13],[13,13]]};
     const bcolors={P1:'#3498db',P2:'#2ecc71',P3:'#e74c3c',P4:'#f1c40f'};
     Object.entries(bc).forEach(([p,circles])=>{
@@ -186,46 +289,42 @@ function GameBoard(){
         ctx.strokeStyle=bcolors[p];ctx.lineWidth=2.5;ctx.stroke();
       });
     });
-    // White track
     ctx.fillStyle='white';
     ctx.fillRect(6*C,0,3*C,15*C);ctx.fillRect(0,6*C,15*C,3*C);
-    // Home lanes
     [{fill:'#f1c40f',sq:[[7,1],[7,2],[7,3],[7,4],[7,5]]},
      {fill:'#e74c3c',sq:[[7,9],[7,10],[7,11],[7,12],[7,13]]},
      {fill:'#3498db',sq:[[9,7],[10,7],[11,7],[12,7],[13,7]]},
      {fill:'#2ecc71',sq:[[1,7],[2,7],[3,7],[4,7],[5,7]]}
     ].forEach(({fill,sq})=>{ctx.fillStyle=fill;sq.forEach(([c,r])=>ctx.fillRect(c*C,r*C,C,C));});
-    // Centre
     const cx2=7.5*C,cy2=7.5*C;
     ctx.beginPath();ctx.arc(cx2,cy2,C*1.2,0,Math.PI*2);ctx.fillStyle='#f0ede8';ctx.fill();
     ctx.beginPath();ctx.arc(cx2,cy2,C*0.5,0,Math.PI*2);ctx.fillStyle='white';ctx.fill();
-    // Grid lines
     ctx.strokeStyle='rgba(0,0,0,0.12)';ctx.lineWidth=0.6;
     for(let r=0;r<15;r++)for(let c=6;c<9;c++)ctx.strokeRect(c*C,r*C,C,C);
     for(let r=6;r<9;r++)for(let c=0;c<15;c++)ctx.strokeRect(c*C,r*C,C,C);
     ctx.strokeStyle='#888';ctx.lineWidth=2;ctx.strokeRect(1,1,S-2,S-2);
   },[]);
 
-  // ── MOVE HELPERS ──────────────────────────────────────────
-  function stepsToHome(p,pos){
-    // Calculate exact steps from current position to home (299)
-    // = steps to TURN_IDX + 6 home lane steps (200->204->299 = 6 steps)
-    if(pos>=200)return(204-pos)+1; // already in home lane
-    const turn=TURN_IDX[p];
-    // Steps from pos to turn on main track (wrapping at 52)
-    const stepsToTurn=pos<=turn?(turn-pos):(52-pos+turn);
-    return stepsToTurn+6; // +6 for home lane
+  // ── SYNC TO FIREBASE ──────────────────────────────────────
+  async function syncState(updates){
+    if(!roomCode)return;
+    await update(ref(db,`rooms/${roomCode}/gameState`),updates);
   }
 
+  // ── MOVE HELPERS ──────────────────────────────────────────
+  function stepsToHome(p,pos){
+    if(pos>=200)return(204-pos)+1;
+    const turn=TURN_IDX[p];
+    const stepsToTurn=pos<=turn?(turn-pos):(52-pos+turn);
+    return stepsToTurn+6;
+  }
   function canMove(p,i,val,isCombined){
     const pos=posRef.current[p][i];
     if(pos===299)return false;
     if(pos===-1)return val===6&&!isCombined&&diceLeftRef.current.includes(6);
-    // In home lane — must not overshoot
     if(pos>=200)return val<=(204-pos)+1;
-    // On main track — check if val would overshoot home
     const steps=stepsToHome(p,pos);
-    if(val>steps)return false; // would overshoot — not allowed
+    if(val>steps)return false;
     return true;
   }
   function getEligible(team,val,isCombined){
@@ -241,17 +340,19 @@ function GameBoard(){
     return res;
   }
 
-  function updateLabel(idx,msg){
+  function updateLabel(idx,msg,isMyT){
     const p=TURN_ORDER[idx];
     const pNum=isP1Turn_(idx)?'1':'2';
     setIsP1Turn(isP1Turn_(idx));
-    setTurnText(msg||`Player ${pNum}'s Turn — ${TOKEN_NAMES[p]} token`);
+    const whose=isMyT?(isMyT?'Your':'Opponent'):(isMyTurn(idx)?'Your':'Opponent');
+    setTurnText(msg||(isMyT?`Your Turn — ${TOKEN_NAMES[p]} token`:`Opponent's Turn — ${TOKEN_NAMES[p]} token`));
   }
 
-  // ── ROLL (timer keeps running!) ────────────────────────────
+  // ── ROLL ──────────────────────────────────────────────────
   async function handleRoll(){
     if(phaseRef.current!=='IDLE'||animRef.current||winner)return;
-    // NOTE: NO stopTimer() here — timer keeps counting through the whole turn
+    if(!myTurn)return; // Not your turn!
+
     setIsAnimating(true);setHighlighted([]);
     setRolling(true);
     await new Promise(r=>setTimeout(r,600));
@@ -267,29 +368,52 @@ function GameBoard(){
     const dl=[d1,d2];
     diceLeftRef.current=dl;setDiceLeft(dl);
     setIsAnimating(false);
+
     const team=curTeam(turnIdxRef.current);
     if(!hasAnyMove(team,d1,d2)){
-      updateLabel(turnIdxRef.current,'No valid move — passing turn');
+      updateLabel(turnIdxRef.current,'No valid move — passing turn',true);
+      // sync and pass turn
+      const next=(turnIdxRef.current+1)%TURN_ORDER.length;
+      await syncState({
+        diceValues:[d1,d2],
+        diceLeft:[],
+        currentTurnIdx:next,
+        phase:'IDLE',
+        originalDice:[d1,d2],
+        pendingRollAgain:false,
+      });
       await new Promise(r=>setTimeout(r,1200));
       nextTurn(turnIdxRef.current);
       return;
     }
+
     setGamePhase('SELECT_DIE');phaseRef.current='SELECT_DIE';
     setPillVal1(d1);setPillVal2(d2);setPillValC(d1+d2);
-    updateLabel(turnIdxRef.current);
+    updateLabel(turnIdxRef.current,null,true);
+
+    // Sync roll to Firebase
+    await syncState({
+      diceValues:[d1,d2],
+      diceLeft:[d1,d2],
+      currentTurnIdx:turnIdxRef.current,
+      phase:'SELECT_DIE',
+      originalDice:[d1,d2],
+      pendingRollAgain:d1===6&&d2===6,
+    });
   }
 
   function selectDie(val,isCombined){
+    if(!myTurn)return;
     setActiveDie(val);setActiveIsCombined(isCombined);
     const team=curTeam(turnIdxRef.current);
     const elig=getEligible(team,val,isCombined);
     if(elig.length>0){
       setHighlighted(elig.map(e=>`${e.p}-${e.i}`));
       setGamePhase('SELECT_PIECE');phaseRef.current='SELECT_PIECE';
-      updateLabel(turnIdxRef.current,`Click a glowing token — ${val} step${val>1?'s':''}`);
+      updateLabel(turnIdxRef.current,`Click a glowing token — ${val} step${val>1?'s':''}`,true);
     } else {
       setActiveDie(null);setActiveIsCombined(false);
-      updateLabel(turnIdxRef.current,`No token can use ${val} — pick another`);
+      updateLabel(turnIdxRef.current,`No token can use ${val} — pick another`,true);
     }
   }
 
@@ -304,15 +428,10 @@ function GameBoard(){
           n[p][idx]=nxt;posRef.current=n;return n;
         });
         rem--;
-        // FIX: check win instantly the moment token reaches home
         if(nxt===299){
           clearInterval(iv);
-          // Small delay for visual then check win
-          setTimeout(()=>{
-            checkWin(posRef.current);
-          },100);
-          resolve(pos);
-          return;
+          setTimeout(()=>{checkWin(posRef.current);},100);
+          resolve(pos);return;
         }
         if(rem===0){clearInterval(iv);resolve(pos);}
       },200);
@@ -362,17 +481,37 @@ function GameBoard(){
     }
     const captured=doCapture(p,idx,landPos,cameFromBase,posRef.current);
     if(captured!==posRef.current){setPositions(captured);posRef.current=captured;}
+    return landPos;
   }
 
   function checkWin(pos){
     const p1Won=PLAYER1.every(p=>pos[p].every(v=>v===299));
     const p2Won=PLAYER2.every(p=>pos[p].every(v=>v===299));
-    if(p1Won){if(gameOverRef.current)return true;gameOverRef.current=true;stopTimer();setScore1(s=>s+1);setWinner({name:'Player 1',reason:'win'});setGamePhase('GAMEOVER');return true;}
-    if(p2Won){if(gameOverRef.current)return true;gameOverRef.current=true;stopTimer();setScore2(s=>s+1);setWinner({name:'Player 2',reason:'win'});setGamePhase('GAMEOVER');return true;}
+    if(p1Won){
+      if(gameOverRef.current)return true;
+      gameOverRef.current=true;
+      stopTimer();
+      const newS1=score1+1;
+      setScore1(newS1);
+      const win={name:'Player 1',reason:'win'};
+      setWinner(win);setGamePhase('GAMEOVER');
+      syncState({winner:win,score1:newS1,score2});
+      return true;
+    }
+    if(p2Won){
+      if(gameOverRef.current)return true;
+      gameOverRef.current=true;
+      stopTimer();
+      const newS2=score2+1;
+      setScore2(newS2);
+      const win={name:'Player 2',reason:'win'};
+      setWinner(win);setGamePhase('GAMEOVER');
+      syncState({winner:win,score1,score2:newS2});
+      return true;
+    }
     return false;
   }
 
-  // ── NEXT TURN: this is where timer resets ─────────────────
   function nextTurn(curIdx){
     setHighlighted([]);
     diceLeftRef.current=[];setDiceLeft([]);
@@ -381,67 +520,88 @@ function GameBoard(){
     const next=(curIdx+1)%TURN_ORDER.length;
     setCurrentTurnIdx(next);turnIdxRef.current=next;
     setGamePhase('IDLE');phaseRef.current='IDLE';
-    updateLabel(next);
-    // Timer resets automatically via useEffect watching currentTurnIdx
+    const myT=isMyTurn(next);
+    setMyTurn(myT);
+    updateLabel(next,null,myT);
   }
 
   async function doMove(p,idx){
+    if(!myTurn)return;
     setIsAnimating(true);animRef.current=true;
     setHighlighted([]);setGamePhase('MOVING');phaseRef.current='MOVING';
     await applyMove(p,idx,activeDie,activeIsCombined);
     setActiveDie(null);setActiveIsCombined(false);
     setIsAnimating(false);animRef.current=false;
-    // Win may have already been declared inside movePieceAnim
     if(gameOverRef.current)return;
     if(checkWin(posRef.current))return;
+
     const dl=diceLeftRef.current;
+    let nextIdx=turnIdxRef.current;
+    let newPhase='IDLE';
+    let newDiceLeft=[];
+
     if(dl.length>0){
       const rv=dl[0];
       const elig=getEligible(curTeam(turnIdxRef.current),rv,false);
       if(elig.length>0){
-        // Still have a usable die — show pill
         setGamePhase('SELECT_DIE');phaseRef.current='SELECT_DIE';
         setPillVal1(rv);
-        updateLabel(turnIdxRef.current,`Use your remaining die (${rv})`);
+        updateLabel(turnIdxRef.current,`Use your remaining die (${rv})`,true);
+        newPhase='SELECT_DIE';
+        newDiceLeft=dl;
+        // Sync current state
+        await syncState({
+          positions:posRef.current,
+          diceLeft:newDiceLeft,
+          currentTurnIdx:nextIdx,
+          phase:newPhase,
+        });
         return;
       } else {
-        // Remaining die exists but no token can use it — clear it
         diceLeftRef.current=[];setDiceLeft([]);
       }
     }
+
     if(pendingRef.current){
-      // Double 6 bonus — player gets to roll again
       setPendingRollAgain(false);pendingRef.current=false;
       diceLeftRef.current=[];setDiceLeft([]);
       setGamePhase('IDLE');phaseRef.current='IDLE';
-      const pNum=isP1Turn_(turnIdxRef.current)?'1':'2';
-      updateLabel(turnIdxRef.current,`Player ${pNum} — Double 6! Roll again 🎲`);
+      const myT=isMyTurn(turnIdxRef.current);
+      setMyTurn(myT);
+      updateLabel(turnIdxRef.current,`Double 6! Roll again 🎲`,myT);
+      await syncState({
+        positions:posRef.current,
+        diceLeft:[],
+        currentTurnIdx:nextIdx,
+        phase:'IDLE',
+        pendingRollAgain:false,
+      });
       return;
     }
+
+    // Pass turn
+    nextIdx=(turnIdxRef.current+1)%TURN_ORDER.length;
     nextTurn(turnIdxRef.current);
+    await syncState({
+      positions:posRef.current,
+      diceLeft:[],
+      currentTurnIdx:nextIdx,
+      phase:'IDLE',
+      pendingRollAgain:false,
+    });
   }
 
   function handleTokenClick(p,idx){
     if(phaseRef.current!=='SELECT_PIECE'||animRef.current)return;
+    if(!myTurn)return;
     if(!curTeam(turnIdxRef.current).includes(p))return;
     if(!highlighted.includes(`${p}-${idx}`))return;
     const clickPos=posRef.current[p][idx];
-
-    // FIX 1: Only show stack picker for tokens ON THE BOARD (not in base)
-    // Base tokens (-1) always just move directly
-    if(clickPos===-1){
-      doMove(p,idx);
-      return;
-    }
-
-    // Check for other tokens on the EXACT same board square
+    if(clickPos===-1){doMove(p,idx);return;}
     const stacked=[];
     curTeam(turnIdxRef.current).forEach(tp=>{
       for(let ti=0;ti<4;ti++){
-        if(!(tp===p&&ti===idx)
-          &&posRef.current[tp][ti]===clickPos
-          &&posRef.current[tp][ti]!==-1  // not in base
-          &&canMove(tp,ti,activeDie,activeIsCombined))
+        if(!(tp===p&&ti===idx)&&posRef.current[tp][ti]===clickPos&&posRef.current[tp][ti]!==-1&&canMove(tp,ti,activeDie,activeIsCombined))
           stacked.push({p:tp,i:ti});
       }
     });
@@ -449,29 +609,65 @@ function GameBoard(){
     else doMove(p,idx);
   }
 
-  function playAgain(){
-    const init={P1:[-1,-1,-1,-1],P2:[-1,-1,-1,-1],P3:[-1,-1,-1,-1],P4:[-1,-1,-1,-1]};
+  async function playAgain(){
+    const init=INIT_POSITIONS;
     setPositions(init);posRef.current=init;
     diceLeftRef.current=[];setDiceLeft([]);
     setGamePhase('IDLE');phaseRef.current='IDLE';
     setCurrentTurnIdx(0);turnIdxRef.current=0;
     setPendingRollAgain(false);pendingRef.current=false;
-    setWinner(null);setHighlighted([]);gameOverRef.current=false;timerOwnerRef.current=null;
+    setWinner(null);gameOverRef.current=false;
+    setHighlighted([]);
     setDiceValues([1,1]);setResultText('–, –');
-    updateLabel(0);
+    timerOwnerRef.current=null;
+    const myT=isMyTurn(0);setMyTurn(myT);
+    updateLabel(0,null,myT);
+    await syncState({
+      positions:init,
+      diceLeft:[],
+      currentTurnIdx:0,
+      phase:'IDLE',
+      pendingRollAgain:false,
+      winner:null,
+      diceValues:[1,1],
+    });
+  }
+
+  // Waiting for opponent screen
+  if(!opponentJoined&&playerNum===1){
+    return(
+      <div className="min-h-screen bg-[#1a1a2e] flex flex-col items-center justify-center px-4">
+        <div className="text-4xl mb-4">⏳</div>
+        <h2 className="text-white font-black text-xl mb-2">Waiting for opponent...</h2>
+        <p className="text-gray-400 text-sm mb-6">Share your room code: <span className="text-yellow-400 font-black">{roomCode}</span></p>
+        <div className="flex gap-1 mb-6">
+          <div className="w-2 h-2 rounded-full bg-yellow-400 animate-bounce" style={{animationDelay:'0ms'}}/>
+          <div className="w-2 h-2 rounded-full bg-yellow-400 animate-bounce" style={{animationDelay:'150ms'}}/>
+          <div className="w-2 h-2 rounded-full bg-yellow-400 animate-bounce" style={{animationDelay:'300ms'}}/>
+        </div>
+        <button onClick={()=>router.push('/play')} className="text-gray-400 text-sm">← Cancel</button>
+      </div>
+    );
   }
 
   return(
     <div className="min-h-screen bg-[#1a1a2e] flex flex-col items-center py-3 px-2">
 
+      {/* My turn indicator */}
+      {myTurn&&!winner&&(
+        <div className="w-full max-w-sm mb-1 py-1 px-3 rounded-lg bg-yellow-400/20 border border-yellow-400/50 text-center">
+          <p className="text-yellow-400 text-xs font-bold">⚡ YOUR TURN</p>
+        </div>
+      )}
+
       {/* Scores */}
       <div className="flex gap-2 w-full max-w-sm mb-2">
         <div className={`flex-1 py-2 px-3 rounded-xl text-center transition-all ${isP1Turn?'bg-gradient-to-r from-red-600 to-red-700 ring-2 ring-yellow-400':'bg-[#ffffff10]'}`}>
-          <p className="text-white text-xs font-bold">Player 1</p>
+          <p className="text-white text-xs font-bold">Player 1 {playerNum===1?'(You)':''}</p>
           <p className="text-white text-xl font-black">{score1}</p>
         </div>
         <div className={`flex-1 py-2 px-3 rounded-xl text-center transition-all ${!isP1Turn?'bg-gradient-to-r from-green-700 to-green-800 ring-2 ring-yellow-400':'bg-[#ffffff10]'}`}>
-          <p className="text-white text-xs font-bold">Player 2</p>
+          <p className="text-white text-xs font-bold">Player 2 {playerNum===2?'(You)':''}</p>
           <p className="text-white text-xl font-black">{score2}</p>
         </div>
       </div>
@@ -488,7 +684,6 @@ function GameBoard(){
               const[x,y]=BASE_COORDS[p][i];
               const r=toPct(x,y,true);lx=r.lx;ly=r.ly;
             } else if(isDone){
-              // ALL done tokens sit exactly at HOME_FINAL — perfectly stacked
               const[hx,hy]=HOME_FINAL[p];
               const r=toPct(hx,hy,false);lx=r.lx;ly=r.ly;
             } else {
@@ -509,7 +704,7 @@ function GameBoard(){
                   zIndex:isDone?3:isHl?10:5,
                   transition:'all 0.2s',
                 }}
-                className={`absolute rounded-full border-2 transform -translate-x-1/2 -translate-y-1/2 ${isHl?'animate-pulse w-[5.5%] h-[5.5%]':isDone?'w-[4.5%] h-[4.5%]':'w-[4.5%] h-[4.5%]'}`}
+                className={`absolute rounded-full border-2 transform -translate-x-1/2 -translate-y-1/2 ${isHl?'animate-pulse w-[5.5%] h-[5.5%]':'w-[4.5%] h-[4.5%]'}`}
               />
             );
           })
@@ -523,67 +718,61 @@ function GameBoard(){
       </div>
       <p className="text-gray-400 text-xs mb-1">{resultText}</p>
 
-      {/* Timer — runs the WHOLE turn including after rolling */}
+      {/* Timer */}
       <div className="w-full max-w-sm mb-2">
         <div className="bg-[#ffffff10] rounded-full h-2">
           <div className="h-2 rounded-full transition-all duration-1000"
-            style={{
-              width:`${(timerSeconds/TIMER_TOTAL)*100}%`,
-              background:timerSeconds>30?'#27ae60':timerSeconds>10?'#f39c12':'#e74c3c'
-            }}/>
+            style={{width:`${(timerSeconds/TIMER_TOTAL)*100}%`,background:timerSeconds>30?'#27ae60':timerSeconds>10?'#f39c12':'#e74c3c'}}/>
         </div>
         <p className={`text-center text-xs mt-0.5 font-bold ${timerSeconds<=10?'text-red-400':timerSeconds<=30?'text-yellow-400':'text-gray-400'}`}>
           {timerSeconds}s remaining
         </p>
       </div>
 
-      {/* Dice pills */}
-      {(gamePhase==='SELECT_DIE')&&(
+      {/* Pills — only show on my turn */}
+      {(gamePhase==='SELECT_DIE')&&myTurn&&(
         <div className="flex gap-2 mb-2 flex-wrap justify-center">
           <button onClick={()=>selectDie(pillVal1,false)}
-            className={`px-4 py-2 rounded-xl font-bold text-sm text-white transition-all ${activeDie===pillVal1?'ring-2 ring-yellow-400 bg-blue-600':'bg-blue-900 hover:bg-blue-800'}`}>
+            className={`px-4 py-2 rounded-xl font-bold text-sm text-white transition-all ${activeDie===pillVal1?'ring-2 ring-yellow-400 bg-blue-600':'bg-blue-900'}`}>
             Use {pillVal1}
           </button>
           {diceLeft.length===2&&(
             <button onClick={()=>selectDie(pillVal2,false)}
-              className={`px-4 py-2 rounded-xl font-bold text-sm text-white transition-all ${activeDie===pillVal2?'ring-2 ring-yellow-400 bg-red-600':'bg-red-900 hover:bg-red-800'}`}>
+              className={`px-4 py-2 rounded-xl font-bold text-sm text-white transition-all ${activeDie===pillVal2?'ring-2 ring-yellow-400 bg-red-600':'bg-red-900'}`}>
               Use {pillVal2}
             </button>
           )}
           {diceLeft.length===2&&(
             <button onClick={()=>selectDie(pillValC,true)}
-              className={`px-4 py-2 rounded-xl font-bold text-sm text-white transition-all ${activeDie===pillValC?'ring-2 ring-yellow-400 bg-green-600':'bg-green-900 hover:bg-green-800'}`}>
+              className={`px-4 py-2 rounded-xl font-bold text-sm text-white transition-all ${activeDie===pillValC?'ring-2 ring-yellow-400 bg-green-600':'bg-green-900'}`}>
               Combine {pillValC}
             </button>
           )}
         </div>
       )}
 
-      {/* Roll button */}
+      {/* Roll button — only enabled on my turn */}
       <button
         onClick={handleRoll}
-        disabled={gamePhase!=='IDLE'||isAnimating||!!winner}
+        disabled={gamePhase!=='IDLE'||isAnimating||!!winner||!myTurn}
         className="w-full max-w-sm py-3 rounded-2xl bg-gradient-to-r from-yellow-400 to-orange-500 text-black font-black text-base disabled:opacity-40 disabled:cursor-not-allowed mb-2 transition-all active:scale-95"
       >
-        🎲 Roll Dice
+        {myTurn?'🎲 Roll Dice':'⏳ Opponent\'s turn...'}
       </button>
 
       {/* Turn label */}
-      <div className={`w-full max-w-sm py-2 px-4 rounded-xl text-center text-sm font-bold text-white transition-all ${isP1Turn?'bg-red-700':'bg-green-700'}`}>
+      <div className={`w-full max-w-sm py-2 px-4 rounded-xl text-center text-sm font-bold text-white ${isP1Turn?'bg-red-700':'bg-green-700'}`}>
         {turnText}
       </div>
 
-      {/* Timer warning popup */}
+      {/* Timer warning */}
       {showWarning&&(
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 px-4">
           <div className="bg-[#1a2a3a] border-2 border-red-500 rounded-2xl p-6 text-center max-w-xs w-full">
             <p className="text-4xl mb-2">⏰</p>
             <p className="text-red-400 font-black text-lg mb-2">Time is running out!</p>
             <p className="text-gray-300 text-sm mb-4">10 seconds left — roll and move now!</p>
-            <button onClick={()=>setShowWarning(false)}
-              className="px-6 py-2 bg-green-500 rounded-xl text-white font-bold active:scale-95">
-              I'm here! ✓
-            </button>
+            <button onClick={()=>setShowWarning(false)} className="px-6 py-2 bg-green-500 rounded-xl text-white font-bold">I'm here! ✓</button>
           </div>
         </div>
       )}
@@ -594,17 +783,13 @@ function GameBoard(){
           <div className="bg-[#1a2a3a] border-2 border-blue-400 rounded-2xl p-4 max-w-xs w-full">
             <p className="text-white font-bold text-center mb-3 text-sm">Which token to move?</p>
             {stackPicker.map(({p,i})=>(
-              <button key={`${p}-${i}`}
-                onClick={()=>{setStackPicker(null);doMove(p,i);}}
+              <button key={`${p}-${i}`} onClick={()=>{setStackPicker(null);doMove(p,i);}}
                 style={{background:COLORS[p]}}
                 className="block w-full py-2.5 rounded-xl text-white font-bold mb-2 text-sm active:scale-95">
                 Move {TOKEN_NAMES[p]} token
               </button>
             ))}
-            <button onClick={()=>setStackPicker(null)}
-              className="block w-full py-2 rounded-xl bg-gray-600 text-white font-bold text-sm">
-              Cancel
-            </button>
+            <button onClick={()=>setStackPicker(null)} className="block w-full py-2 rounded-xl bg-gray-600 text-white font-bold text-sm">Cancel</button>
           </div>
         </div>
       )}
@@ -615,9 +800,7 @@ function GameBoard(){
           <div className="bg-[#1a2a3a] border-2 border-yellow-400 rounded-2xl p-8 text-center max-w-xs w-full">
             <p className="text-6xl mb-3">{winner.reason==='timeout'?'⏰':'🏆'}</p>
             <p className="text-yellow-400 font-black text-2xl mb-1">{winner.name} Wins!</p>
-            <p className="text-gray-400 text-sm mb-2">
-              {winner.reason==='timeout'?'Opponent timed out':'All tokens home!'}
-            </p>
+            <p className="text-gray-400 text-sm mb-2">{winner.reason==='timeout'?'Timed out':'All tokens home!'}</p>
             <p className="text-gray-300 text-sm mb-6">Score — P1: {score1} | P2: {score2}</p>
             <button onClick={playAgain}
               className="w-full py-3 rounded-2xl bg-gradient-to-r from-yellow-400 to-orange-500 text-black font-black text-lg mb-3 active:scale-95">
@@ -636,11 +819,7 @@ function GameBoard(){
 
 export default function GamePage(){
   return(
-    <Suspense fallback={
-      <div className="min-h-screen bg-[#1a1a2e] flex items-center justify-center">
-        <p className="text-white text-xl">Loading game...</p>
-      </div>
-    }>
+    <Suspense fallback={<div className="min-h-screen bg-[#1a1a2e] flex items-center justify-center"><p className="text-white text-xl">Loading game...</p></div>}>
       <GameBoard/>
     </Suspense>
   );

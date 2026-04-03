@@ -2,6 +2,8 @@
 import { useState, useEffect } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense } from 'react';
+import { db } from '../../firebase';
+import { ref, onValue } from 'firebase/database';
 
 function WaitingRoom() {
   const router = useRouter();
@@ -10,6 +12,22 @@ function WaitingRoom() {
   const stake = params.get('stake');
   const [timeLeft, setTimeLeft] = useState(300);
 
+  // Listen for opponent joining
+  useEffect(() => {
+    if (!code) return;
+    const roomRef = ref(db, `rooms/${code}`);
+    const unsubscribe = onValue(roomRef, (snapshot) => {
+      if (!snapshot.exists()) return;
+      const data = snapshot.val();
+      if (data.status === 'ready' && data.player2) {
+        // Opponent joined — go to game as Player 1
+        router.push(`/game?code=${code}&player=1`);
+      }
+    });
+    return () => unsubscribe();
+  }, [code, router]);
+
+  // Countdown
   useEffect(() => {
     if (timeLeft <= 0) {
       router.push('/play');
@@ -25,7 +43,7 @@ function WaitingRoom() {
   const seconds = timeLeft % 60;
 
   function handleShare() {
-    const message = `Join my AfriDice game! 🎲\nRoom Code: ${code}\nStake: ${stake} USDC\nOpen AfriDice and click "Join Room"`;
+    const message = `Join my AfriDice game! 🎲\nRoom Code: ${code}\nStake: ${stake} USDC\nGo to afridice.vercel.app → Play → Join Room`;
     if (navigator.share) {
       navigator.share({ text: message });
     } else {
@@ -36,14 +54,8 @@ function WaitingRoom() {
 
   return (
     <div className="min-h-screen bg-[#1a1a2e] flex flex-col px-4 py-6">
-      {/* Header */}
       <div className="flex items-center gap-3 mb-8">
-        <button
-          onClick={() => router.push('/play')}
-          className="text-gray-400 text-sm"
-        >
-          ← Cancel
-        </button>
+        <button onClick={() => router.push('/play')} className="text-gray-400 text-sm">← Cancel</button>
         <h2 className="text-xl font-black text-white">Waiting for opponent</h2>
       </div>
 
@@ -88,7 +100,7 @@ function WaitingRoom() {
         </div>
       </div>
 
-      {/* Loading indicator */}
+      {/* Loading */}
       <div className="flex items-center justify-center gap-2 mb-8">
         <div className="w-2 h-2 rounded-full bg-yellow-400 animate-bounce" style={{animationDelay:'0ms'}}/>
         <div className="w-2 h-2 rounded-full bg-yellow-400 animate-bounce" style={{animationDelay:'150ms'}}/>
@@ -96,11 +108,8 @@ function WaitingRoom() {
         <p className="text-gray-400 text-sm ml-1">Waiting for friend to join...</p>
       </div>
 
-      {/* Share button */}
-      <button
-        onClick={handleShare}
-        className="w-full py-4 rounded-2xl bg-gradient-to-r from-yellow-400 to-orange-500 text-black font-black text-lg active:scale-95 transition-transform"
-      >
+      <button onClick={handleShare}
+        className="w-full py-4 rounded-2xl bg-gradient-to-r from-yellow-400 to-orange-500 text-black font-black text-lg active:scale-95 transition-transform">
         📤 Share Room Code
       </button>
     </div>
