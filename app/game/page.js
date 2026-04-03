@@ -166,22 +166,25 @@ function GameBoard(){
           setDiceValues(gs.diceValues);
           setResultText(`${gs.diceValues[0]}, ${gs.diceValues[1]}  (${gs.diceValues[0]+gs.diceValues[1]})`);
         }
-        if(gs.diceLeft!==undefined){
-          diceLeftRef.current=gs.diceLeft;
-          setDiceLeft(gs.diceLeft);
-          // NEVER force pills from Firebase listener
-          // Pills are only set when THIS player rolls on their own device
-          // If diceLeft is empty, reset phase to IDLE for this player
-          if(gs.diceLeft.length===0&&phaseRef.current==='SELECT_DIE'){
+        // diceLeft and phase are NEVER read from Firebase
+        // Each player manages their own dice state locally
+        // Only reset to IDLE when turn changes to opponent
+        if(gs.currentTurnIdx!==undefined){
+          const isMine=isMyTurn(gs.currentTurnIdx);
+          if(!isMine&&phaseRef.current!=='IDLE'&&phaseRef.current!=='MOVING'){
+            // It's opponent's turn now - reset our local state
             setGamePhase('IDLE');phaseRef.current='IDLE';
+            diceLeftRef.current=[];setDiceLeft([]);
+            setHighlighted([]);setActiveDie(null);
           }
         }
         if(gs.phase){
           // Only update phase for opponent actions, never override our own SELECT_DIE
           const isMine=isMyTurn(gs.currentTurnIdx||0);
           if(!isMine){
-            setGamePhase(gs.phase);
-            phaseRef.current=gs.phase;
+            // Don't set phase from Firebase - we handle it locally
+            // Just ensure we're in IDLE when it's not our turn
+            if(gs.phase==='IDLE'&&phaseRef.current!=='IDLE'){
           }
         }
         if(gs.originalDice){
@@ -407,9 +410,7 @@ function GameBoard(){
     // diceLeft is local state only, never shared to avoid spill-over bug
     await syncState({
       diceValues:[d1,d2],
-      diceLeft:[],
       currentTurnIdx:turnIdxRef.current,
-      phase:'SELECT_DIE',
       originalDice:[d1,d2],
       pendingRollAgain:d1===6&&d2===6,
     });
@@ -565,9 +566,7 @@ function GameBoard(){
         // Sync current state
         await syncState({
           positions:posRef.current,
-          diceLeft:[],
           currentTurnIdx:nextIdx,
-          phase:newPhase,
         });
         return;
       } else {
