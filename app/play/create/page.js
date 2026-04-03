@@ -1,6 +1,8 @@
 'use client';
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { db } from '../../firebase';
+import { ref, set } from 'firebase/database';
 
 const STAKE_OPTIONS = ['Free', '$1', '$3', '$5', '$10', 'Custom'];
 
@@ -9,6 +11,7 @@ export default function CreateRoom() {
   const [selectedStake, setSelectedStake] = useState('$1');
   const [customAmount, setCustomAmount] = useState('');
   const [showCustom, setShowCustom] = useState(false);
+  const [loading, setLoading] = useState(false);
 
   function handleStakeSelect(option) {
     if (option === 'Custom') {
@@ -20,36 +23,42 @@ export default function CreateRoom() {
     }
   }
 
-  function handleCreate() {
+  async function handleCreate() {
     const stake = selectedStake === 'Custom' ? `$${customAmount}` : selectedStake;
     if (selectedStake === 'Custom' && !customAmount) {
       alert('Please enter a custom amount');
       return;
     }
+
+    setLoading(true);
+
     // Generate 6-digit room code
     const code = Math.floor(100000 + Math.random() * 900000).toString();
-    // Pass code and stake to the waiting room
+
+    // Save room to Firebase
+    await set(ref(db, `rooms/${code}`), {
+      code,
+      stake,
+      status: 'waiting',
+      createdAt: Date.now(),
+      player1: 'Player 1',
+      player2: null,
+    });
+
+    setLoading(false);
     router.push(`/play/waiting?code=${code}&stake=${stake}`);
   }
 
   return (
     <div className="min-h-screen bg-[#1a1a2e] flex flex-col px-4 py-6">
-
-      {/* Header */}
       <div className="flex items-center gap-3 mb-8">
-        <button
-          onClick={() => router.push('/play')}
-          className="text-gray-400 text-sm"
-        >
-          ←
-        </button>
+        <button onClick={() => router.push('/play')} className="text-gray-400 text-sm">← </button>
         <div>
           <h2 className="text-xl font-black text-white">Create Room</h2>
           <p className="text-gray-400 text-xs">Set your stake and invite a friend</p>
         </div>
       </div>
 
-      {/* Stake selector */}
       <div className="mb-8">
         <p className="text-white font-bold text-sm mb-3">Select Stake Amount</p>
         <div className="grid grid-cols-3 gap-3">
@@ -68,7 +77,6 @@ export default function CreateRoom() {
           ))}
         </div>
 
-        {/* Custom amount input */}
         {showCustom && (
           <div className="mt-4">
             <div className="flex items-center gap-2 bg-[#ffffff10] border border-white/20 rounded-xl px-4 py-3">
@@ -85,7 +93,6 @@ export default function CreateRoom() {
         )}
       </div>
 
-      {/* Game info */}
       <div className="bg-[#ffffff08] border border-white/10 rounded-xl p-4 mb-8">
         <p className="text-gray-400 text-xs mb-2 font-semibold uppercase tracking-wider">Game Info</p>
         <div className="flex justify-between items-center mb-2">
@@ -106,14 +113,13 @@ export default function CreateRoom() {
         </div>
       </div>
 
-      {/* Create button */}
       <button
         onClick={handleCreate}
-        className="w-full py-4 rounded-2xl bg-gradient-to-r from-yellow-400 to-orange-500 text-black font-black text-lg active:scale-95 transition-transform shadow-lg"
+        disabled={loading}
+        className="w-full py-4 rounded-2xl bg-gradient-to-r from-yellow-400 to-orange-500 text-black font-black text-lg active:scale-95 transition-transform shadow-lg disabled:opacity-60"
       >
-        🎲 Create Room
+        {loading ? '⏳ Creating Room...' : '🎲 Create Room'}
       </button>
-
     </div>
   );
 }
