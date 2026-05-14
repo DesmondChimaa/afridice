@@ -98,8 +98,11 @@ function GameBoard(){
   const posRef=useRef(positions);
   const diceLeftRef=useRef([]);
   const phaseRef=useRef('IDLE');
+  const activeDieRef=useRef(null);
+  const activeIsCombinedRef=useRef(false);
   const animRef=useRef(false);
   const turnIdxRef=useRef(0);
+  const lastSyncedTurnIdxRef=useRef(null);
   const origDiceRef=useRef([1,1]);
   const pendingRef=useRef(false);
   const timerRef=useRef(null);
@@ -121,6 +124,16 @@ function GameBoard(){
   function isMyTurn(idx){
     const team=curTeam(idx);
     return playerNum===1?team===PLAYER1:team===PLAYER2;
+  }
+
+  function resetLocalTurnState(){
+    diceLeftRef.current=[];setDiceLeft([]);
+    setActiveDie(null);activeDieRef.current=null;
+    setActiveIsCombined(false);activeIsCombinedRef.current=false;
+    setHighlighted([]);
+    setStackPicker(null);
+    setGamePhase('IDLE');phaseRef.current='IDLE';
+    setIsAnimating(false);animRef.current=false;
   }
 
   // ── FIREBASE LISTENER ─────────────────────────────────────
@@ -154,6 +167,11 @@ function GameBoard(){
 
         // Update turn
         if(gs.currentTurnIdx!==undefined){
+          const turnChanged=lastSyncedTurnIdxRef.current!==null&&lastSyncedTurnIdxRef.current!==gs.currentTurnIdx;
+          if(turnChanged){
+            resetLocalTurnState();
+          }
+          lastSyncedTurnIdxRef.current=gs.currentTurnIdx;
           setCurrentTurnIdx(gs.currentTurnIdx);
           turnIdxRef.current=gs.currentTurnIdx;
           const myT=isMyTurn(gs.currentTurnIdx);
@@ -166,27 +184,8 @@ function GameBoard(){
           setDiceValues(gs.diceValues);
           setResultText(`${gs.diceValues[0]}, ${gs.diceValues[1]}  (${gs.diceValues[0]+gs.diceValues[1]})`);
         }
-        // diceLeft and phase are NEVER read from Firebase
-        // Each player manages their own dice state locally
-        // Only reset to IDLE when turn changes to opponent
-        if(gs.currentTurnIdx!==undefined){
-          const isMine=isMyTurn(gs.currentTurnIdx);
-          if(!isMine&&phaseRef.current!=='IDLE'&&phaseRef.current!=='MOVING'){
-            // It's opponent's turn now - reset our local state
-            setGamePhase('IDLE');phaseRef.current='IDLE';
-            diceLeftRef.current=[];setDiceLeft([]);
-            setHighlighted([]);setActiveDie(null);
-          }
-        }
-        if(gs.phase){
-          // Only update phase for opponent actions, never override our own SELECT_DIE
-          const isMine=isMyTurn(gs.currentTurnIdx||0);
-          if(!isMine){
-            // Don't set phase from Firebase - we handle it locally
-            // Just ensure we're in IDLE when it's not our turn
-            if(gs.phase==='IDLE'&&phaseRef.current!=='IDLE'){
-          }
-        }
+        // diceLeft, phase, activeDie, and highlighted are local-only.
+        // A Firebase turn change above is the single place that clears them.
         if(gs.originalDice){
           setOriginalDice(gs.originalDice);
           origDiceRef.current=gs.originalDice;
@@ -317,7 +316,6 @@ function GameBoard(){
     const ro=new ResizeObserver(drawBoard);
     if(boardRef.current)ro.observe(boardRef.current);
     return()=>{clearTimeout(t1);clearTimeout(t2);clearTimeout(t3);ro.disconnect();};
-  // eslint-disable-next-line
   },[opponentJoined]);
 
   // ── SYNC TO FIREBASE ──────────────────────────────────────
@@ -391,9 +389,7 @@ function GameBoard(){
       const next=(turnIdxRef.current+1)%TURN_ORDER.length;
       await syncState({
         diceValues:[d1,d2],
-        diceLeft:[],
         currentTurnIdx:next,
-        phase:'IDLE',
         originalDice:[d1,d2],
         pendingRollAgain:false,
       });
@@ -418,6 +414,7 @@ function GameBoard(){
 
   function selectDie(val,isCombined){
     if(!myTurn)return;
+    activeDieRef.current=val;activeIsCombinedRef.current=isCombined;
     setActiveDie(val);setActiveIsCombined(isCombined);
     const team=curTeam(turnIdxRef.current);
     const elig=getEligible(team,val,isCombined);
@@ -426,6 +423,7 @@ function GameBoard(){
       setGamePhase('SELECT_PIECE');phaseRef.current='SELECT_PIECE';
       updateLabel(turnIdxRef.current,`Click a glowing token — ${val} step${val>1?'s':''}`,true);
     } else {
+      activeDieRef.current=null;activeIsCombinedRef.current=false;
       setActiveDie(null);setActiveIsCombined(false);
       updateLabel(turnIdxRef.current,`No token can use ${val} — pick another`,true);
     }
@@ -529,6 +527,7 @@ function GameBoard(){
   function nextTurn(curIdx){
     setHighlighted([]);
     diceLeftRef.current=[];setDiceLeft([]);
+    activeDieRef.current=null;activeIsCombinedRef.current=false;
     setActiveDie(null);setActiveIsCombined(false);
     setPendingRollAgain(false);pendingRef.current=false;
     const next=(curIdx+1)%TURN_ORDER.length;
@@ -539,11 +538,13 @@ function GameBoard(){
     updateLabel(next,null,myT);
   }
 
-  async function doMove(p,idx){
+  async function doMove(p,idx,dieValue=activeDieRef.current,isCombined=activeIsCombinedRef.current){
     if(!myTurn)return;
+    if(!dieValue)return;
     setIsAnimating(true);animRef.current=true;
     setHighlighted([]);setGamePhase('MOVING');phaseRef.current='MOVING';
-    await applyMove(p,idx,activeDie,activeIsCombined);
+    await applyMove(p,idx,dieValue,isCombined);
+    activeDieRef.current=null;activeIsCombinedRef.current=false;
     setActiveDie(null);setActiveIsCombined(false);
     setIsAnimating(false);animRef.current=false;
     if(gameOverRef.current)return;
@@ -551,8 +552,6 @@ function GameBoard(){
 
     const dl=diceLeftRef.current;
     let nextIdx=turnIdxRef.current;
-    let newPhase='IDLE';
-    let newDiceLeft=[];
 
     if(dl.length>0){
       const rv=dl[0];
@@ -561,8 +560,6 @@ function GameBoard(){
         setGamePhase('SELECT_DIE');phaseRef.current='SELECT_DIE';
         setPillVal1(rv);
         updateLabel(turnIdxRef.current,`Use your remaining die (${rv})`,true);
-        newPhase='SELECT_DIE';
-        newDiceLeft=dl;
         // Sync current state
         await syncState({
           positions:posRef.current,
@@ -583,9 +580,7 @@ function GameBoard(){
       updateLabel(turnIdxRef.current,`Double 6! Roll again 🎲`,myT);
       await syncState({
         positions:posRef.current,
-        diceLeft:[],
         currentTurnIdx:nextIdx,
-        phase:'IDLE',
         pendingRollAgain:false,
       });
       return;
@@ -596,9 +591,7 @@ function GameBoard(){
     nextTurn(turnIdxRef.current);
     await syncState({
       positions:posRef.current,
-      diceLeft:[],
       currentTurnIdx:nextIdx,
-      phase:'IDLE',
       pendingRollAgain:false,
     });
   }
@@ -608,23 +601,27 @@ function GameBoard(){
     if(!myTurn)return;
     if(!curTeam(turnIdxRef.current).includes(p))return;
     if(!highlighted.includes(`${p}-${idx}`))return;
+    const dieValue=activeDieRef.current;
+    const isCombined=activeIsCombinedRef.current;
     const clickPos=posRef.current[p][idx];
-    if(clickPos===-1){doMove(p,idx);return;}
+    if(clickPos===-1){doMove(p,idx,dieValue,isCombined);return;}
     const stacked=[];
     curTeam(turnIdxRef.current).forEach(tp=>{
       for(let ti=0;ti<4;ti++){
-        if(!(tp===p&&ti===idx)&&posRef.current[tp][ti]===clickPos&&posRef.current[tp][ti]!==-1&&canMove(tp,ti,activeDie,activeIsCombined))
+        if(!(tp===p&&ti===idx)&&posRef.current[tp][ti]===clickPos&&posRef.current[tp][ti]!==-1&&canMove(tp,ti,dieValue,isCombined))
           stacked.push({p:tp,i:ti});
       }
     });
     if(stacked.length>0){stacked.unshift({p,i:idx});setStackPicker(stacked);}
-    else doMove(p,idx);
+    else doMove(p,idx,dieValue,isCombined);
   }
 
   async function playAgain(){
     const init=INIT_POSITIONS;
     setPositions(init);posRef.current=init;
     diceLeftRef.current=[];setDiceLeft([]);
+    activeDieRef.current=null;activeIsCombinedRef.current=false;
+    setActiveDie(null);setActiveIsCombined(false);
     setGamePhase('IDLE');phaseRef.current='IDLE';
     setCurrentTurnIdx(0);turnIdxRef.current=0;
     setPendingRollAgain(false);pendingRef.current=false;
@@ -636,9 +633,7 @@ function GameBoard(){
     updateLabel(0,null,myT);
     await syncState({
       positions:init,
-      diceLeft:[],
       currentTurnIdx:0,
-      phase:'IDLE',
       pendingRollAgain:false,
       winner:null,
       diceValues:[1,1],
@@ -784,7 +779,7 @@ function GameBoard(){
             <p className="text-4xl mb-2">⏰</p>
             <p className="text-red-400 font-black text-lg mb-2">Time is running out!</p>
             <p className="text-gray-300 text-sm mb-4">10 seconds left — roll and move now!</p>
-            <button onClick={()=>setShowWarning(false)} className="px-6 py-2 bg-green-500 rounded-xl text-white font-bold">I'm here! ✓</button>
+            <button onClick={()=>setShowWarning(false)} className="px-6 py-2 bg-green-500 rounded-xl text-white font-bold">I&apos;m here! ✓</button>
           </div>
         </div>
       )}
